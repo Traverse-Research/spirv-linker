@@ -2,8 +2,14 @@
 name = "spirv-linker"
 version = "0.1.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "SPIR-V linker"
+homepage = "https://traverseresearch.nl"
+documentation = "https://docs.rs/spirv-linker"
+readme = "README.md"
+keywords = ["rendering"]
+categories = ["api-bindings", "rendering"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Traverse-Research/spirv-linker"
 
 [dependencies]
 rspirv = "0.11"
