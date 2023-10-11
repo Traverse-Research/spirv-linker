@@ -13,7 +13,7 @@ A linker for SPIR-V binaries, directly lifted from the linker in `rust-gpu`, int
 
 ```toml
 [dependencies]
-spirv-linker = "0.1"
+spirv-linker = "0.1.0"
 ```
 
 ### License
