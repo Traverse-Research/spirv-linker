@@ -96,6 +96,20 @@ fn remove_duplicate_capablities(module: &mut rspirv::dr::Module) {
     module.capabilities = caps;
 }
 
+/// Two input modules can both declare the same `OpExtension "..."` —
+/// after the merge the linked module ends up with the same extension
+/// listed twice. Vulkan accepts that, but it's gratuitous noise on the
+/// wire and parallels the other dedup passes; collapse by name.
+fn remove_duplicate_extensions(module: &mut rspirv::dr::Module) {
+    let mut seen = HashSet::new();
+    module
+        .extensions
+        .retain(|inst| match inst.operands.first() {
+            Some(rspirv::dr::Operand::LiteralString(s)) => seen.insert(s.clone()),
+            _ => true,
+        });
+}
+
 fn remove_duplicate_ext_inst_imports(module: &mut rspirv::dr::Module) {
     use std::collections::hash_map::Entry;
 
@@ -1143,6 +1157,382 @@ fn dedup_entry_point_interfaces(module: &mut rspirv::dr::Module) {
     }
 }
 
+/// Drop `OpCapability` (and the matching `OpExtension`) declarations that
+/// nothing in the linked module actually uses.
+///
+/// DXC under `-fspv-target-env=universal1.5` declares a kitchen-sink set
+/// of capabilities and extensions on every emitted lib (the universal
+/// envelope advertises every optional feature DXC can target). After
+/// linking a compute shader, the result still carries declarations like
+/// `OpCapability MinLod`, `OpCapability FragmentShaderSampleInterlockEXT`,
+/// `OpCapability ComputeDerivativeGroupQuadsKHR`, etc., even though no
+/// instruction references them. Vulkan's validation layer rejects each
+/// one with VUID-VkShaderModuleCreateInfo-pCode-08740 / -08742 unless
+/// the corresponding `VkPhysicalDeviceFeatures` bit is enabled.
+///
+/// The conceptually right fix is the SPIR-V grammar's full
+/// "capability-required-by-opcode" table (which is what
+/// `spirv-opt --trim-capabilities` uses). We don't have that data
+/// bundled, so this pass handles the specific capabilities DXC over-
+/// declares for compute shaders, with a hand-curated predicate per
+/// capability that asks "does any instruction in the module actually
+/// require this?". Capabilities outside this denylist are left alone.
+fn trim_unused_capabilities(module: &mut rspirv::dr::Module) {
+    // Each entry: (capability we'll drop if `is_used` returns false,
+    // optional extension to drop alongside *iff* every capability that
+    // depends on that extension is also being dropped).
+    //
+    // The extension is dropped via a separate pass after we know the
+    // final kept-capability set, so capabilities that share an extension
+    // (e.g. ComputeDerivativeGroup{Quads,Linear}KHR both ride on
+    // SPV_KHR_compute_shader_derivatives) are handled correctly: the
+    // extension only goes away when none of its consumers remain.
+    struct Rule {
+        capability: spirv::Capability,
+        extension: Option<&'static str>,
+        is_used: fn(&rspirv::dr::Module) -> bool,
+    }
+
+    let rules: &[Rule] = &[
+        Rule {
+            capability: spirv::Capability::MinLod,
+            extension: None,
+            is_used: uses_image_min_lod,
+        },
+        Rule {
+            capability: spirv::Capability::InterpolationFunction,
+            extension: None,
+            is_used: uses_glsl_interpolate_at,
+        },
+        Rule {
+            capability: spirv::Capability::FragmentShaderSampleInterlockEXT,
+            extension: Some("SPV_EXT_fragment_shader_interlock"),
+            is_used: uses_fragment_sample_interlock,
+        },
+        Rule {
+            capability: spirv::Capability::FragmentShaderPixelInterlockEXT,
+            extension: Some("SPV_EXT_fragment_shader_interlock"),
+            is_used: uses_fragment_pixel_interlock,
+        },
+        Rule {
+            capability: spirv::Capability::FragmentShaderShadingRateInterlockEXT,
+            extension: Some("SPV_EXT_fragment_shader_interlock"),
+            is_used: uses_fragment_shading_rate_interlock,
+        },
+        Rule {
+            capability: spirv::Capability::ComputeDerivativeGroupQuadsKHR,
+            extension: Some("SPV_KHR_compute_shader_derivatives"),
+            is_used: uses_compute_derivative_group_quads,
+        },
+        Rule {
+            capability: spirv::Capability::ComputeDerivativeGroupLinearKHR,
+            extension: Some("SPV_KHR_compute_shader_derivatives"),
+            is_used: uses_compute_derivative_group_linear,
+        },
+        Rule {
+            capability: spirv::Capability::QuadControlKHR,
+            extension: Some("SPV_KHR_quad_control"),
+            is_used: uses_quad_control,
+        },
+        Rule {
+            capability: spirv::Capability::GroupNonUniformPartitionedEXT,
+            extension: Some("SPV_NV_shader_subgroup_partitioned"),
+            is_used: uses_group_non_uniform_partitioned,
+        },
+    ];
+
+    let mut drop_caps: HashSet<spirv::Capability> = HashSet::new();
+    // For each extension under consideration, count how many of its rules
+    // still keep the capability — the extension only goes if all such
+    // rules choose to drop.
+    let mut extension_keepers: HashMap<&'static str, usize> = HashMap::new();
+    for rule in rules {
+        if let Some(ext) = rule.extension {
+            *extension_keepers.entry(ext).or_insert(0) += 0;
+        }
+    }
+    for rule in rules {
+        let used = (rule.is_used)(module);
+        if !used {
+            drop_caps.insert(rule.capability);
+        } else if let Some(ext) = rule.extension {
+            *extension_keepers.get_mut(ext).unwrap() += 1;
+        }
+    }
+    let drop_exts: HashSet<&'static str> = extension_keepers
+        .into_iter()
+        .filter_map(|(ext, keepers)| if keepers == 0 { Some(ext) } else { None })
+        .collect();
+
+    module
+        .capabilities
+        .retain(|inst| match inst.operands.first() {
+            Some(rspirv::dr::Operand::Capability(c)) => !drop_caps.contains(c),
+            _ => true,
+        });
+    module
+        .extensions
+        .retain(|inst| match inst.operands.first() {
+            Some(rspirv::dr::Operand::LiteralString(s)) => !drop_exts.contains(s.as_str()),
+            _ => true,
+        });
+}
+
+fn uses_image_min_lod(module: &rspirv::dr::Module) -> bool {
+    for inst in module.all_inst_iter() {
+        for op in &inst.operands {
+            if let rspirv::dr::Operand::ImageOperands(io) = op {
+                if io.contains(spirv::ImageOperands::MIN_LOD) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn uses_glsl_interpolate_at(module: &rspirv::dr::Module) -> bool {
+    // GLSL.std.450 InterpolateAtCentroid = 76, AtSample = 77, AtOffset = 78.
+    let glsl_id = module.ext_inst_imports.iter().find_map(|inst| {
+        let name = match inst.operands.first()? {
+            rspirv::dr::Operand::LiteralString(s) => s,
+            _ => return None,
+        };
+        if name == "GLSL.std.450" {
+            inst.result_id
+        } else {
+            None
+        }
+    });
+    let Some(glsl_id) = glsl_id else {
+        return false;
+    };
+    for inst in module.all_inst_iter() {
+        if inst.class.opcode != spirv::Op::ExtInst {
+            continue;
+        }
+        let Some(rspirv::dr::Operand::IdRef(set)) = inst.operands.first() else {
+            continue;
+        };
+        if *set != glsl_id {
+            continue;
+        }
+        let n = match inst.operands.get(1) {
+            Some(rspirv::dr::Operand::LiteralExtInstInteger(n)) => *n,
+            Some(rspirv::dr::Operand::LiteralBit32(n)) => *n,
+            _ => continue,
+        };
+        if matches!(n, 76 | 77 | 78) {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_execution_mode(module: &rspirv::dr::Module, want: spirv::ExecutionMode) -> bool {
+    module.execution_modes.iter().any(|inst| {
+        inst.operands
+            .iter()
+            .any(|op| matches!(op, rspirv::dr::Operand::ExecutionMode(m) if *m == want))
+    })
+}
+
+fn has_opcode(module: &rspirv::dr::Module, want: spirv::Op) -> bool {
+    module.all_inst_iter().any(|inst| inst.class.opcode == want)
+}
+
+fn uses_fragment_sample_interlock(module: &rspirv::dr::Module) -> bool {
+    has_execution_mode(module, spirv::ExecutionMode::SampleInterlockOrderedEXT)
+        || has_execution_mode(module, spirv::ExecutionMode::SampleInterlockUnorderedEXT)
+}
+
+fn uses_fragment_pixel_interlock(module: &rspirv::dr::Module) -> bool {
+    has_execution_mode(module, spirv::ExecutionMode::PixelInterlockOrderedEXT)
+        || has_execution_mode(module, spirv::ExecutionMode::PixelInterlockUnorderedEXT)
+}
+
+fn uses_fragment_shading_rate_interlock(module: &rspirv::dr::Module) -> bool {
+    has_execution_mode(module, spirv::ExecutionMode::ShadingRateInterlockOrderedEXT)
+        || has_execution_mode(
+            module,
+            spirv::ExecutionMode::ShadingRateInterlockUnorderedEXT,
+        )
+}
+
+fn uses_compute_derivative_group_quads(module: &rspirv::dr::Module) -> bool {
+    has_execution_mode(module, spirv::ExecutionMode::DerivativeGroupQuadsKHR)
+}
+
+fn uses_compute_derivative_group_linear(module: &rspirv::dr::Module) -> bool {
+    has_execution_mode(module, spirv::ExecutionMode::DerivativeGroupLinearKHR)
+}
+
+fn uses_quad_control(module: &rspirv::dr::Module) -> bool {
+    // SPIR-V QuadControlKHR is required by OpGroupNonUniformQuadAllKHR
+    // and OpGroupNonUniformQuadAnyKHR. rspirv exposes the All variant;
+    // the Any variant has the next opcode number (5111) but isn't named
+    // in this rspirv build, so check by raw opcode integer.
+    module.all_inst_iter().any(|inst| {
+        inst.class.opcode == spirv::Op::GroupNonUniformQuadAllKHR
+            || inst.class.opcode as u32 == 5111
+    })
+}
+
+fn uses_group_non_uniform_partitioned(module: &rspirv::dr::Module) -> bool {
+    has_opcode(module, spirv::Op::GroupNonUniformPartitionEXT)
+}
+
+#[cfg(test)]
+mod trim_unused_capabilities_tests {
+    use super::*;
+    use rspirv::dr::{Instruction, Module, Operand};
+    use rspirv::spirv::{Capability, Op};
+
+    fn op_capability(cap: Capability) -> Instruction {
+        Instruction::new(Op::Capability, None, None, vec![Operand::Capability(cap)])
+    }
+    fn op_extension(name: &str) -> Instruction {
+        Instruction::new(
+            Op::Extension,
+            None,
+            None,
+            vec![Operand::LiteralString(name.to_owned())],
+        )
+    }
+
+    /// A compute module with no instruction that references any of the
+    /// over-declared capabilities should have all of them stripped, plus
+    /// the matching extensions.
+    #[test]
+    fn drops_unused_capabilities_and_extensions_on_compute_module() {
+        let mut module = Module::new();
+        // Keep one capability we don't trim (Shader) so we can assert
+        // unrelated entries aren't disturbed.
+        module.capabilities.push(op_capability(Capability::Shader));
+        module.capabilities.push(op_capability(Capability::MinLod));
+        module
+            .capabilities
+            .push(op_capability(Capability::InterpolationFunction));
+        module
+            .capabilities
+            .push(op_capability(Capability::FragmentShaderSampleInterlockEXT));
+        module
+            .capabilities
+            .push(op_capability(Capability::FragmentShaderPixelInterlockEXT));
+        module.capabilities.push(op_capability(
+            Capability::FragmentShaderShadingRateInterlockEXT,
+        ));
+        module
+            .capabilities
+            .push(op_capability(Capability::ComputeDerivativeGroupQuadsKHR));
+        module
+            .capabilities
+            .push(op_capability(Capability::ComputeDerivativeGroupLinearKHR));
+        module
+            .capabilities
+            .push(op_capability(Capability::QuadControlKHR));
+        module
+            .capabilities
+            .push(op_capability(Capability::GroupNonUniformPartitionedEXT));
+        module
+            .extensions
+            .push(op_extension("SPV_EXT_fragment_shader_interlock"));
+        module
+            .extensions
+            .push(op_extension("SPV_KHR_compute_shader_derivatives"));
+        module.extensions.push(op_extension("SPV_KHR_quad_control"));
+        module
+            .extensions
+            .push(op_extension("SPV_NV_shader_subgroup_partitioned"));
+        // Unrelated extension that no rule touches.
+        module
+            .extensions
+            .push(op_extension("SPV_KHR_storage_buffer_storage_class"));
+
+        trim_unused_capabilities(&mut module);
+
+        let kept_caps: Vec<Capability> = module
+            .capabilities
+            .iter()
+            .filter_map(|inst| match inst.operands.first() {
+                Some(Operand::Capability(c)) => Some(*c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kept_caps,
+            vec![Capability::Shader],
+            "all denylisted capabilities should be dropped"
+        );
+
+        let kept_exts: Vec<String> = module
+            .extensions
+            .iter()
+            .filter_map(|inst| match inst.operands.first() {
+                Some(Operand::LiteralString(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kept_exts,
+            vec!["SPV_KHR_storage_buffer_storage_class".to_owned()],
+            "extensions tied to dropped capabilities should be dropped, others left alone"
+        );
+    }
+
+    /// If an instruction in the module actually uses the capability
+    /// (here: an `ImageOperands::MIN_LOD` bit on a sampling op), the
+    /// trim pass must keep the corresponding `OpCapability MinLod`.
+    #[test]
+    fn keeps_min_lod_when_image_operand_uses_it() {
+        let mut module = Module::new();
+        module.capabilities.push(op_capability(Capability::MinLod));
+
+        // Synthesize a function with one OpImageSampleExplicitLod whose
+        // ImageOperands carries the MIN_LOD bit. The exact ids aren't
+        // important — the trim pass only walks operands looking for the
+        // bitflag.
+        let sample = Instruction::new(
+            Op::ImageSampleExplicitLod,
+            Some(10),
+            Some(11),
+            vec![
+                Operand::IdRef(20),
+                Operand::IdRef(21),
+                Operand::ImageOperands(spirv::ImageOperands::MIN_LOD),
+                Operand::IdRef(22),
+            ],
+        );
+        let block = rspirv::dr::Block {
+            label: Some(Instruction::new(Op::Label, None, Some(99), vec![])),
+            instructions: vec![sample],
+        };
+        let func = rspirv::dr::Function {
+            def: Some(Instruction::new(
+                Op::Function,
+                Some(10),
+                Some(100),
+                vec![
+                    Operand::FunctionControl(spirv::FunctionControl::NONE),
+                    Operand::IdRef(10),
+                ],
+            )),
+            end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
+            parameters: vec![],
+            blocks: vec![block],
+        };
+        module.functions.push(func);
+
+        trim_unused_capabilities(&mut module);
+
+        assert_eq!(
+            module.capabilities.len(),
+            1,
+            "MinLod capability must be retained while an image operand uses MIN_LOD"
+        );
+    }
+}
+
 fn sort_globals(module: &mut rspirv::dr::Module) {
     let mut ts = TopologicalSort::<u32>::new();
 
@@ -1438,6 +1828,7 @@ pub fn link(inputs: &mut [&mut rspirv::dr::Module], opts: &Options) -> Result<rs
 
     // remove duplicates (https://github.com/KhronosGroup/SPIRV-Tools/blob/e7866de4b1dc2a7e8672867caeb0bdca49f458d3/source/opt/remove_duplicates_pass.cpp)
     remove_duplicate_capablities(&mut output);
+    remove_duplicate_extensions(&mut output);
     remove_duplicate_ext_inst_imports(&mut output);
     let mut output = remove_duplicate_types(output);
     // jb-todo: strip identical OpDecoration / OpDecorationGroups
@@ -1455,6 +1846,7 @@ pub fn link(inputs: &mut [&mut rspirv::dr::Module], opts: &Options) -> Result<rs
 
     dedup_entry_point_interfaces(&mut output);
     remove_duplicate_annotations(&mut output);
+    trim_unused_capabilities(&mut output);
 
     sort_globals(&mut output);
 
