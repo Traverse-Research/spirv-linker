@@ -189,6 +189,74 @@ mod remove_duplicate_types_tests {
             "expected the three duplicate OpTypeInt to collapse to one, got {int_count}",
         );
     }
+
+    /// `OpConstant %float 0` and `OpConstant %uint 0` have identical
+    /// operands but different result-types, so they must NOT be
+    /// collapsed. The previous dedup key was `(opcode, operands)` only,
+    /// which silently merged them — and downstream uses (like an
+    /// `OpConstantComposite %v3float ...`) ended up referencing a
+    /// `uint` constant where a `float` was expected, producing
+    /// "OpConstantComposite Constituent <id>'s type does not match
+    /// Result Type's vector element type" at SPIR-V validation.
+    #[test]
+    fn keeps_constants_with_same_value_but_different_types() {
+        let float_type_id = 1_u32;
+        let uint_type_id = 2_u32;
+        let float_zero_id = 10_u32;
+        let uint_zero_id = 20_u32;
+
+        let mut module = Module::new();
+        module.types_global_values.push(Instruction::new(
+            Op::TypeFloat,
+            None,
+            Some(float_type_id),
+            vec![Operand::LiteralBit32(32)],
+        ));
+        module.types_global_values.push(Instruction::new(
+            Op::TypeInt,
+            None,
+            Some(uint_type_id),
+            vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+        ));
+        module.types_global_values.push(Instruction::new(
+            Op::Constant,
+            Some(float_type_id),
+            Some(float_zero_id),
+            vec![Operand::LiteralBit32(0)],
+        ));
+        module.types_global_values.push(Instruction::new(
+            Op::Constant,
+            Some(uint_type_id),
+            Some(uint_zero_id),
+            vec![Operand::LiteralBit32(0)],
+        ));
+
+        let linked = remove_duplicate_types(module);
+
+        let constants: Vec<&Instruction> = linked
+            .types_global_values
+            .iter()
+            .filter(|i| i.class.opcode == Op::Constant)
+            .collect();
+        assert_eq!(
+            constants.len(),
+            2,
+            "constants with same operands but different result-types must not merge"
+        );
+        // Both type-id-distinct constants survive.
+        assert!(
+            constants
+                .iter()
+                .any(|c| c.result_type == Some(float_type_id)),
+            "float zero constant got dropped"
+        );
+        assert!(
+            constants
+                .iter()
+                .any(|c| c.result_type == Some(uint_type_id)),
+            "uint zero constant got dropped"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -252,8 +320,7 @@ mod ext_inst_imports_dedup_tests {
                 Operand::IdRef(result_type),
             ],
         );
-        let func_end =
-            Instruction::new(Op::FunctionEnd, None, None, vec![]);
+        let func_end = Instruction::new(Op::FunctionEnd, None, None, vec![]);
 
         let func = rspirv::dr::Function {
             def: Some(func_def),
@@ -389,12 +456,28 @@ fn remove_duplicate_types(module: rspirv::dr::Module) -> rspirv::dr::Module {
                 continue;
             }
 
-            // partially assemble only the opcode and operands to be used as a key
-            // maybe this should also include the result_type
+            // Partial assembly used as a dedup key: opcode, result-type
+            // (if any), and operands. The result-type is essential —
+            // `OpConstant %float 0` and `OpConstant %uint 0` have
+            // identical operands but are different constants, and
+            // collapsing them produced an `OpConstantComposite %v3float
+            // %uint_0 %uint_0 %uint_0` type-mismatch downstream.
             let data = {
                 let mut data = vec![];
 
                 data.push(inst.class.opcode as u32);
+                // Sentinel-prefixed result-type so a None / Some(0) on
+                // typed instructions can't be confused for a missing
+                // type on type-defining ones (which never have one).
+                match inst.result_type {
+                    Some(t) => {
+                        data.push(0xffff_ffff);
+                        data.push(t);
+                    }
+                    None => {
+                        data.push(0xffff_fffe);
+                    }
+                }
                 for op in &inst.operands {
                     op.assemble_into(&mut data);
                 }
