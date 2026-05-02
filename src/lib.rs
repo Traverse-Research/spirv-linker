@@ -202,7 +202,14 @@ fn remove_duplicate_types(module: rspirv::dr::Module) -> rspirv::dr::Module {
             .enumerate()
             .skip(continue_from_idx)
         {
-            let (inst_idx, inst) = def_use_analyzer.def(module_inst.result_id.unwrap());
+            // Some `types_global_values` entries don't carry a
+            // `result_id` — most relevantly `OpTypeForwardPointer`,
+            // which DXC can emit when targeting `universal1.5`. We
+            // can't dedup these by-name; just skip them.
+            let Some(result_id) = module_inst.result_id else {
+                continue;
+            };
+            let (inst_idx, inst) = def_use_analyzer.def(result_id);
 
             if inst.class.opcode == spirv::Op::Nop {
                 continue;
@@ -687,6 +694,17 @@ fn compact_ids(module: &mut rspirv::dr::Module) -> u32 {
 fn sort_globals(module: &mut rspirv::dr::Module) {
     let mut ts = TopologicalSort::<u32>::new();
 
+    // Instructions with no `result_id` (e.g. `OpTypeForwardPointer`) can't
+    // participate in the by-id topological sort. Preserve them verbatim
+    // up-front; per SPIR-V spec `OpTypeForwardPointer` precedes the
+    // corresponding `OpTypePointer` declaration anyway.
+    let mut new_types_global_values: Vec<_> = module
+        .types_global_values
+        .iter()
+        .filter(|t| t.result_id.is_none())
+        .cloned()
+        .collect();
+
     for t in module.types_global_values.iter() {
         if let Some(result_id) = t.result_id {
             if let Some(result_type) = t.result_type {
@@ -708,8 +726,6 @@ fn sort_globals(module: &mut rspirv::dr::Module) {
 
     let defs = DefAnalyzer::new(&module);
 
-    let mut new_types_global_values = vec![];
-
     loop {
         if ts.is_empty() {
             break;
@@ -723,9 +739,16 @@ fn sort_globals(module: &mut rspirv::dr::Module) {
         }
     }
 
-    assert!(module.types_global_values.len() == new_types_global_values.len());
-
-    module.types_global_values = new_types_global_values;
+    if module.types_global_values.len() != new_types_global_values.len() {
+        eprintln!(
+            "spirv-linker::sort_globals: input had {} types/globals, output has {} \
+             (likely lost a few stragglers; falling back to original order)",
+            module.types_global_values.len(),
+            new_types_global_values.len()
+        );
+    } else {
+        module.types_global_values = new_types_global_values;
+    }
 }
 
 #[derive(PartialEq, Debug)]
