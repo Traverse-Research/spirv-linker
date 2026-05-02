@@ -147,6 +147,51 @@ fn remove_duplicate_ext_inst_imports(module: &mut rspirv::dr::Module) {
 }
 
 #[cfg(test)]
+mod remove_duplicate_types_tests {
+    use super::*;
+    use rspirv::dr::{Instruction, Module, Operand};
+    use rspirv::spirv::Op;
+
+    fn op_type_int(result_id: u32, width: u32, signed: u32) -> Instruction {
+        Instruction::new(
+            Op::TypeInt,
+            None,
+            Some(result_id),
+            vec![Operand::LiteralBit32(width), Operand::LiteralBit32(signed)],
+        )
+    }
+
+    /// Three `OpTypeInt 32 0` declarations with different result-ids
+    /// should all collapse to one. The previous implementation only
+    /// caught two of them: it advanced `continue_from_idx` past the
+    /// kept instance after each duplicate, so by the third pass the
+    /// dedup HashMap was empty and the third copy was inserted as a
+    /// fresh entry rather than recognised as a duplicate of the first.
+    /// Vulkan rejects the resulting binary with
+    /// "Duplicate non-aggregate type declarations are not allowed".
+    #[test]
+    fn collapses_more_than_two_duplicate_types() {
+        let mut module = Module::new();
+        // Three `OpTypeInt 32 0` with different ids.
+        module.types_global_values.push(op_type_int(10, 32, 0));
+        module.types_global_values.push(op_type_int(20, 32, 0));
+        module.types_global_values.push(op_type_int(30, 32, 0));
+
+        let linked = remove_duplicate_types(module);
+
+        let int_count = linked
+            .types_global_values
+            .iter()
+            .filter(|i| i.class.opcode == Op::TypeInt)
+            .count();
+        assert_eq!(
+            int_count, 1,
+            "expected the three duplicate OpTypeInt to collapse to one, got {int_count}",
+        );
+    }
+}
+
+#[cfg(test)]
 mod ext_inst_imports_dedup_tests {
     use super::*;
     use rspirv::dr::{Instruction, Module, Operand};
@@ -318,19 +363,19 @@ fn remove_duplicate_types(module: rspirv::dr::Module) -> rspirv::dr::Module {
     let mut def_use_analyzer = DefUseAnalyzer::new(&mut instructions);
 
     let mut kill_annotations = vec![];
-    let mut continue_from_idx = 0;
 
-    // need to do this process iteratively because types can reference each other
+    // Iterative because types can reference each other: after merging
+    // `OpTypeInt %A`/`%B`, two `OpTypePointer`s that were pointing at
+    // each become identical and themselves become duplicates. We
+    // restart from index 0 with a fresh dedup map every pass — an
+    // earlier optimisation tried to resume from the latest backtrack
+    // point but ended up advancing past kept instances and silently
+    // missing duplicate groups in the tail of the array.
     loop {
         let mut dedup = std::collections::HashMap::new();
         let mut duplicate = None;
 
-        for (iterator_idx, module_inst) in module
-            .types_global_values
-            .iter()
-            .enumerate()
-            .skip(continue_from_idx)
-        {
+        for module_inst in module.types_global_values.iter() {
             // Some `types_global_values` entries don't carry a
             // `result_id` — most relevantly `OpTypeForwardPointer`,
             // which DXC can emit when targeting `universal1.5`. We
@@ -357,24 +402,19 @@ fn remove_duplicate_types(module: rspirv::dr::Module) -> rspirv::dr::Module {
                 data
             };
 
-            // dedup contains a tuple of three indices;
-            // the first two point into our `def_use_analyzer.instructions` map
-            // the last one points into the `module.types_global_values` iterator so we can resume iteration
             dedup
                 .entry(data)
-                .and_modify(|(identical_idx, backtrack_idx)| {
-                    duplicate = Some((inst_idx, *identical_idx, *backtrack_idx));
+                .and_modify(|identical_idx| {
+                    duplicate = Some((inst_idx, *identical_idx));
                 })
-                .or_insert((inst_idx, iterator_idx)); // store the index that we encountered an instruction
-                                                      // for the first time so we can backtrack later
+                .or_insert(inst_idx);
 
-            if let Some((_, _, backtrack_idx)) = duplicate {
-                continue_from_idx = backtrack_idx;
+            if duplicate.is_some() {
                 break;
             }
         }
 
-        if let Some((before_idx, after_idx, _)) = duplicate {
+        if let Some((before_idx, after_idx)) = duplicate {
             let before_id = def_use_analyzer.instructions[before_idx].result_id.unwrap();
             let after_id = def_use_analyzer.instructions[after_idx].result_id.unwrap();
 
