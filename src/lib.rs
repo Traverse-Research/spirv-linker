@@ -260,6 +260,141 @@ mod remove_duplicate_types_tests {
 }
 
 #[cfg(test)]
+mod dedup_entry_point_interfaces_tests {
+    use super::*;
+    use rspirv::dr::{Instruction, Module, Operand};
+    use rspirv::spirv::{ExecutionModel, Op};
+
+    /// `OpEntryPoint Compute %main "main" %5 %7 %5` (with a duplicate
+    /// in the interface list, mimicking the post-dedup state where
+    /// two original variables collapsed to the same id) should
+    /// collapse to `... %5 %7`. Vulkan rejects the binary otherwise
+    /// with "Non-unique OpEntryPoint interface".
+    #[test]
+    fn drops_duplicate_interface_ids() {
+        let mut module = Module::new();
+        module.entry_points.push(Instruction::new(
+            Op::EntryPoint,
+            None,
+            None,
+            vec![
+                Operand::ExecutionModel(ExecutionModel::GLCompute),
+                Operand::IdRef(1),
+                Operand::LiteralString("main".to_owned()),
+                Operand::IdRef(5),
+                Operand::IdRef(7),
+                Operand::IdRef(5),
+            ],
+        ));
+
+        dedup_entry_point_interfaces(&mut module);
+
+        let interface: Vec<u32> = module.entry_points[0]
+            .operands
+            .iter()
+            .skip(3)
+            .filter_map(|op| {
+                if let Operand::IdRef(id) = op {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(interface, vec![5, 7]);
+    }
+}
+
+#[cfg(test)]
+mod remove_duplicate_annotations_tests {
+    use super::*;
+    use rspirv::dr::{Instruction, Module, Operand};
+    use rspirv::spirv::{Decoration, Op};
+
+    /// After ID dedup collapses two `OpVariable`s onto the same id, every
+    /// `OpDecorate` that previously decorated either of them now decorates
+    /// the kept id — producing two identical `OpDecorate %5 DescriptorSet 0`
+    /// (and similar) entries. spirv-val rejects this with "ID 'N' decorated
+    /// with DescriptorSet multiple times is not allowed". Dedup must collapse
+    /// fully-identical annotation instructions.
+    #[test]
+    fn collapses_identical_op_decorate_pairs() {
+        let mut module = Module::new();
+        let target = 5_u32;
+        let make_decorate_descriptor_set = || {
+            Instruction::new(
+                Op::Decorate,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(target),
+                    Operand::Decoration(Decoration::DescriptorSet),
+                    Operand::LiteralBit32(0),
+                ],
+            )
+        };
+        let make_decorate_binding = || {
+            Instruction::new(
+                Op::Decorate,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(target),
+                    Operand::Decoration(Decoration::Binding),
+                    Operand::LiteralBit32(7),
+                ],
+            )
+        };
+        // Two duplicate DescriptorSet decorations and two duplicate Binding
+        // decorations — exactly what ID dedup leaves behind.
+        module.annotations.push(make_decorate_descriptor_set());
+        module.annotations.push(make_decorate_binding());
+        module.annotations.push(make_decorate_descriptor_set());
+        module.annotations.push(make_decorate_binding());
+
+        // A non-duplicate decoration on a different id should be preserved.
+        module.annotations.push(Instruction::new(
+            Op::Decorate,
+            None,
+            None,
+            vec![
+                Operand::IdRef(9),
+                Operand::Decoration(Decoration::DescriptorSet),
+                Operand::LiteralBit32(0),
+            ],
+        ));
+
+        remove_duplicate_annotations(&mut module);
+
+        assert_eq!(
+            module.annotations.len(),
+            3,
+            "expected 4 duplicates to collapse to 2, plus the unrelated one to remain"
+        );
+        let descriptor_set_count = module
+            .annotations
+            .iter()
+            .filter(|i| {
+                i.class.opcode == Op::Decorate
+                    && i.operands.first() == Some(&Operand::IdRef(target))
+                    && i.operands.get(1) == Some(&Operand::Decoration(Decoration::DescriptorSet))
+            })
+            .count();
+        assert_eq!(descriptor_set_count, 1);
+        let binding_count = module
+            .annotations
+            .iter()
+            .filter(|i| {
+                i.class.opcode == Op::Decorate
+                    && i.operands.first() == Some(&Operand::IdRef(target))
+                    && i.operands.get(1) == Some(&Operand::Decoration(Decoration::Binding))
+            })
+            .count();
+        assert_eq!(binding_count, 1);
+    }
+}
+
+#[cfg(test)]
 mod ext_inst_imports_dedup_tests {
     use super::*;
     use rspirv::dr::{Instruction, Module, Operand};
@@ -943,6 +1078,71 @@ fn compact_ids(module: &mut rspirv::dr::Module) -> u32 {
     remap.len() as u32 + 1
 }
 
+/// Remove fully-identical duplicate instructions from
+/// `module.annotations`. After merging input modules, dedup of types /
+/// variables collapses ids — and the `OpDecorate` / `OpMemberDecorate`
+/// instructions that previously decorated the dropped ids get rewritten
+/// to point at the kept ones, leaving the kept ids decorated multiple
+/// times with the same decoration. spirv-val rejects e.g. "ID 'N'
+/// decorated with DescriptorSet multiple times is not allowed".
+fn remove_duplicate_annotations(module: &mut rspirv::dr::Module) {
+    use rspirv::binary::Assemble;
+    let mut seen = HashSet::new();
+    let original = std::mem::take(&mut module.annotations);
+    module.annotations.reserve(original.len());
+    for inst in original {
+        let mut key = vec![inst.class.opcode as u32];
+        for op in &inst.operands {
+            op.assemble_into(&mut key);
+        }
+        if seen.insert(key) {
+            module.annotations.push(inst);
+        }
+    }
+}
+
+/// `OpEntryPoint`'s interface list (the IdRef operands after the
+/// execution model, function id, and name) names every `Input` /
+/// `Output` / `StorageBuffer` / `Workgroup` / `Private` global
+/// variable the entry point uses. After we merge multiple input
+/// modules, dedup of `OpVariable`s collapses two names that pointed at
+/// what's now the same id — but the entry point's interface list
+/// still mentions both of them, so the merged id appears more than
+/// once. spirv-val rejects the binary with "Non-unique OpEntryPoint
+/// interface 'N[%N]' is disallowed".
+///
+/// Walk every `OpEntryPoint`, drop duplicate IdRefs in the trailing
+/// interface section while preserving order.
+fn dedup_entry_point_interfaces(module: &mut rspirv::dr::Module) {
+    for inst in module.entry_points.iter_mut() {
+        if inst.class.opcode != spirv::Op::EntryPoint {
+            continue;
+        }
+        // Operands 0..=2 are the ExecutionModel, function id, and
+        // name; everything from index 3 on is the interface list.
+        const INTERFACE_START: usize = 3;
+        if inst.operands.len() <= INTERFACE_START {
+            continue;
+        }
+
+        let head: Vec<_> = inst.operands.drain(..INTERFACE_START).collect();
+        let mut seen = HashSet::new();
+        let mut deduped: Vec<rspirv::dr::Operand> = Vec::new();
+        for op in inst.operands.drain(..) {
+            match op {
+                rspirv::dr::Operand::IdRef(id) => {
+                    if seen.insert(id) {
+                        deduped.push(rspirv::dr::Operand::IdRef(id));
+                    }
+                }
+                other => deduped.push(other),
+            }
+        }
+        inst.operands = head;
+        inst.operands.extend(deduped);
+    }
+}
+
 fn sort_globals(module: &mut rspirv::dr::Module) {
     let mut ts = TopologicalSort::<u32>::new();
 
@@ -1252,6 +1452,9 @@ pub fn link(inputs: &mut [&mut rspirv::dr::Module], opts: &Options) -> Result<rs
 
     // remove linkage specific instructions
     kill_linkage_instructions(&matching_pairs, &mut output, &opts);
+
+    dedup_entry_point_interfaces(&mut output);
+    remove_duplicate_annotations(&mut output);
 
     sort_globals(&mut output);
 
