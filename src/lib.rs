@@ -30,6 +30,14 @@ pub fn load(bytes: &[u8]) -> rspirv::dr::Module {
     module
 }
 
+/// Convenience over [`load`] that parses a slice of SPIR-V words (the
+/// natural form of DXC's `-spirv` output).
+pub fn load_words(words: &[u32]) -> rspirv::dr::Module {
+    let mut loader = rspirv::dr::Loader::new();
+    rspirv::binary::parse_words(words, &mut loader).unwrap();
+    loader.module()
+}
+
 fn shift_ids(module: &mut rspirv::dr::Module, add: u32) {
     module.all_inst_iter_mut().for_each(|inst| {
         if let Some(ref mut result_id) = &mut inst.result_id {
@@ -758,11 +766,11 @@ fn trans_scalar_type(inst: &rspirv::dr::Instruction) -> Option<ScalarType> {
         },
         spirv::Op::TypeInt => ScalarType::Int {
             width: match inst.operands[0] {
-                rspirv::dr::Operand::LiteralInt32(w) => w,
+                rspirv::dr::Operand::LiteralBit32(w) => w,
                 _ => panic!("Unexpected operand while parsing type"),
             },
             signed: match inst.operands[1] {
-                rspirv::dr::Operand::LiteralInt32(s) => {
+                rspirv::dr::Operand::LiteralBit32(s) => {
                     if s == 0 {
                         false
                     } else {
@@ -774,7 +782,7 @@ fn trans_scalar_type(inst: &rspirv::dr::Instruction) -> Option<ScalarType> {
         },
         spirv::Op::TypeFloat => ScalarType::Float {
             width: match inst.operands[0] {
-                rspirv::dr::Operand::LiteralInt32(w) => w,
+                rspirv::dr::Operand::LiteralBit32(w) => w,
                 _ => panic!("Unexpected operand while parsing type"),
             },
         },
@@ -828,15 +836,15 @@ fn op_def(def: &DefAnalyzer, operand: &rspirv::dr::Operand) -> rspirv::dr::Instr
 
 fn extract_literal_int_as_u64(op: &rspirv::dr::Operand) -> u64 {
     match op {
-        rspirv::dr::Operand::LiteralInt32(v) => (*v).into(),
-        rspirv::dr::Operand::LiteralInt64(v) => *v,
+        rspirv::dr::Operand::LiteralBit32(v) => (*v).into(),
+        rspirv::dr::Operand::LiteralBit64(v) => *v,
         _ => panic!("Unexpected literal int"),
     }
 }
 
 fn extract_literal_u32(op: &rspirv::dr::Operand) -> u32 {
     match op {
-        rspirv::dr::Operand::LiteralInt32(v) => *v,
+        rspirv::dr::Operand::LiteralBit32(v) => *v,
         _ => panic!("Unexpected literal u32"),
     }
 }
@@ -989,4 +997,17 @@ pub fn link(inputs: &mut [&mut rspirv::dr::Module], opts: &Options) -> Result<rs
 
     // output the module
     Ok(output)
+}
+
+/// Convenience wrapper: take raw SPIR-V word slices, link them, return the
+/// linked binary as a fresh `Vec<u32>`. The natural shape for callers that
+/// already hold the words from a compiler invocation (e.g. DXC `-spirv`).
+pub fn link_bytes(modules: &[&[u32]], opts: &Options) -> Result<Vec<u32>> {
+    use rspirv::binary::Assemble;
+
+    let mut parsed: Vec<rspirv::dr::Module> =
+        modules.iter().map(|words| load_words(words)).collect();
+    let mut refs: Vec<&mut rspirv::dr::Module> = parsed.iter_mut().collect();
+    let linked = link(&mut refs, opts)?;
+    Ok(linked.assemble())
 }
