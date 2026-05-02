@@ -97,21 +97,150 @@ fn remove_duplicate_capablities(module: &mut rspirv::dr::Module) {
 }
 
 fn remove_duplicate_ext_inst_imports(module: &mut rspirv::dr::Module) {
-    let mut set = HashSet::new();
-    let mut caps = vec![];
+    use std::collections::hash_map::Entry;
 
-    for c in &module.ext_inst_imports {
-        let keep = match &c.operands[0] {
-            rspirv::dr::Operand::LiteralString(ext_inst_import) => set.insert(ext_inst_import),
-            _ => true,
+    // Each `OpExtInstImport` defines a result-id that subsequent
+    // `OpExtInst` instructions reference as their "set" operand. When
+    // we merge multiple input modules that all import the same
+    // extended instruction set (e.g. "GLSL.std.450"), id-shifting gave
+    // each import its own result-id but they're semantically the same
+    // import. Dedup them by name *and* rewrite every subsequent
+    // reference to the dropped id to point at the kept one — otherwise
+    // the linked module ends up with `OpExtInst` instructions whose
+    // set-id no longer references any `OpExtInstImport`, producing a
+    // spirv-val error of the form "OpExtInst set Id N does not
+    // reference an OpExtInstImport result Id" and (typically) a
+    // driver-side access violation when the module is loaded.
+    let mut kept_by_name: HashMap<String, u32> = HashMap::new();
+    let mut new_imports: Vec<rspirv::dr::Instruction> = Vec::new();
+    let mut id_remap: Vec<(u32, u32)> = Vec::new();
+
+    for inst in &module.ext_inst_imports {
+        let name = match inst.operands.first() {
+            Some(rspirv::dr::Operand::LiteralString(s)) => s.clone(),
+            _ => {
+                new_imports.push(inst.clone());
+                continue;
+            }
         };
-
-        if keep {
-            caps.push(c.clone());
+        // `OpExtInstImport` always carries a result-id; if it doesn't,
+        // this module is malformed and there's nothing to dedup against.
+        let Some(this_id) = inst.result_id else {
+            new_imports.push(inst.clone());
+            continue;
+        };
+        match kept_by_name.entry(name) {
+            Entry::Occupied(e) => {
+                id_remap.push((this_id, *e.get()));
+            }
+            Entry::Vacant(e) => {
+                e.insert(this_id);
+                new_imports.push(inst.clone());
+            }
         }
     }
 
-    module.ext_inst_imports = caps;
+    module.ext_inst_imports = new_imports;
+    for (old_id, new_id) in id_remap {
+        replace_all_uses_with(module, old_id, new_id);
+    }
+}
+
+#[cfg(test)]
+mod ext_inst_imports_dedup_tests {
+    use super::*;
+    use rspirv::dr::{Instruction, Module, Operand};
+    use rspirv::spirv::Op;
+
+    /// Construct a tiny module with two `OpExtInstImport "GLSL.std.450"`
+    /// declarations (mimicking the post-id-shift state of two merged
+    /// inputs) plus a single `OpExtInst` that references the second
+    /// (later) import. The dedup pass must keep the first import and
+    /// rewrite the `OpExtInst` set-id to point at it.
+    #[test]
+    fn rewrites_op_ext_inst_set_id_when_dropping_duplicate() {
+        let kept_id = 5_u32;
+        let dropped_id = 47_u32;
+
+        let import_glsl_first = Instruction::new(
+            Op::ExtInstImport,
+            None,
+            Some(kept_id),
+            vec![Operand::LiteralString("GLSL.std.450".to_owned())],
+        );
+        let import_glsl_second = Instruction::new(
+            Op::ExtInstImport,
+            None,
+            Some(dropped_id),
+            vec![Operand::LiteralString("GLSL.std.450".to_owned())],
+        );
+
+        // OpExtInst is permitted inside a function body. Build a minimal
+        // function with one block holding the call we want to verify.
+        let result_type = 100_u32;
+        let result_id = 101_u32;
+        let arg_id = 102_u32;
+        // GLSL.std.450 Sqrt = 31
+        let glsl_sqrt = 31_u32;
+
+        let ext_inst_call = Instruction::new(
+            Op::ExtInst,
+            Some(result_type),
+            Some(result_id),
+            vec![
+                Operand::IdRef(dropped_id),
+                Operand::LiteralBit32(glsl_sqrt),
+                Operand::IdRef(arg_id),
+            ],
+        );
+
+        let block = rspirv::dr::Block {
+            label: Some(Instruction::new(Op::Label, None, Some(200), vec![])),
+            instructions: vec![ext_inst_call],
+        };
+        let func_def = Instruction::new(
+            Op::Function,
+            Some(result_type),
+            Some(300),
+            vec![
+                Operand::FunctionControl(rspirv::spirv::FunctionControl::NONE),
+                Operand::IdRef(result_type),
+            ],
+        );
+        let func_end =
+            Instruction::new(Op::FunctionEnd, None, None, vec![]);
+
+        let func = rspirv::dr::Function {
+            def: Some(func_def),
+            end: Some(func_end),
+            parameters: vec![],
+            blocks: vec![block],
+        };
+
+        let mut module = Module::new();
+        module.ext_inst_imports.push(import_glsl_first);
+        module.ext_inst_imports.push(import_glsl_second);
+        module.functions.push(func);
+
+        remove_duplicate_ext_inst_imports(&mut module);
+
+        // Only the first import survives.
+        assert_eq!(module.ext_inst_imports.len(), 1);
+        assert_eq!(module.ext_inst_imports[0].result_id, Some(kept_id));
+
+        // The OpExtInst's set-id must have been rewritten to point at
+        // the surviving import — that's what the bug fix is for.
+        let call = &module.functions[0].blocks[0].instructions[0];
+        assert_eq!(call.class.opcode, Op::ExtInst);
+        match &call.operands[0] {
+            Operand::IdRef(id) => assert_eq!(
+                *id, kept_id,
+                "OpExtInst set-id should have been rewritten from \
+                 dropped {dropped_id} to kept {kept_id}, got {id}"
+            ),
+            other => panic!("expected IdRef, got {other:?}"),
+        }
+    }
 }
 
 fn kill_with_id(insts: &mut Vec<rspirv::dr::Instruction>, id: u32) {
