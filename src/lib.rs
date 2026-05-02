@@ -1013,10 +1013,18 @@ fn kill_linkage_instructions(
     }
 
     // drop imported variables
+    //
+    // `types_global_values` mixes type declarations, constants, and
+    // global `OpVariable`s — most carry a `result_id`, but a few don't
+    // (notably `OpTypeForwardPointer`, which DXC can emit when targeting
+    // `universal1.5`). Treat those as never-matching: they can't be the
+    // import we're looking at, and unconditionally `.unwrap()`-ing
+    // panics the linker on otherwise-valid inputs.
     for pair in pairs.iter() {
-        module
-            .types_global_values
-            .retain(|v| pair.import.id != v.result_id.unwrap());
+        module.types_global_values.retain(|v| match v.result_id {
+            Some(id) => pair.import.id != id,
+            None => true,
+        });
     }
 
     // drop linkage attributes (both import and export)
