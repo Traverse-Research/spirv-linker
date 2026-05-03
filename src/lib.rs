@@ -96,22 +96,412 @@ fn remove_duplicate_capablities(module: &mut rspirv::dr::Module) {
     module.capabilities = caps;
 }
 
-fn remove_duplicate_ext_inst_imports(module: &mut rspirv::dr::Module) {
-    let mut set = HashSet::new();
-    let mut caps = vec![];
-
-    for c in &module.ext_inst_imports {
-        let keep = match &c.operands[0] {
-            rspirv::dr::Operand::LiteralString(ext_inst_import) => set.insert(ext_inst_import),
+/// Two input modules can both declare the same `OpExtension "..."` —
+/// after the merge the linked module ends up with the same extension
+/// listed twice. Vulkan accepts that, but it's gratuitous noise on the
+/// wire and parallels the other dedup passes; collapse by name.
+fn remove_duplicate_extensions(module: &mut rspirv::dr::Module) {
+    let mut seen = HashSet::new();
+    module
+        .extensions
+        .retain(|inst| match inst.operands.first() {
+            Some(rspirv::dr::Operand::LiteralString(s)) => seen.insert(s.clone()),
             _ => true,
-        };
+        });
+}
 
-        if keep {
-            caps.push(c.clone());
+fn remove_duplicate_ext_inst_imports(module: &mut rspirv::dr::Module) {
+    use std::collections::hash_map::Entry;
+
+    // Each `OpExtInstImport` defines a result-id that subsequent
+    // `OpExtInst` instructions reference as their "set" operand. When
+    // we merge multiple input modules that all import the same
+    // extended instruction set (e.g. "GLSL.std.450"), id-shifting gave
+    // each import its own result-id but they're semantically the same
+    // import. Dedup them by name *and* rewrite every subsequent
+    // reference to the dropped id to point at the kept one — otherwise
+    // the linked module ends up with `OpExtInst` instructions whose
+    // set-id no longer references any `OpExtInstImport`, producing a
+    // spirv-val error of the form "OpExtInst set Id N does not
+    // reference an OpExtInstImport result Id" and (typically) a
+    // driver-side access violation when the module is loaded.
+    let mut kept_by_name: HashMap<String, u32> = HashMap::new();
+    let mut new_imports: Vec<rspirv::dr::Instruction> = Vec::new();
+    let mut id_remap: Vec<(u32, u32)> = Vec::new();
+
+    for inst in &module.ext_inst_imports {
+        let name = match inst.operands.first() {
+            Some(rspirv::dr::Operand::LiteralString(s)) => s.clone(),
+            _ => {
+                new_imports.push(inst.clone());
+                continue;
+            }
+        };
+        // `OpExtInstImport` always carries a result-id; if it doesn't,
+        // this module is malformed and there's nothing to dedup against.
+        let Some(this_id) = inst.result_id else {
+            new_imports.push(inst.clone());
+            continue;
+        };
+        match kept_by_name.entry(name) {
+            Entry::Occupied(e) => {
+                id_remap.push((this_id, *e.get()));
+            }
+            Entry::Vacant(e) => {
+                e.insert(this_id);
+                new_imports.push(inst.clone());
+            }
         }
     }
 
-    module.ext_inst_imports = caps;
+    module.ext_inst_imports = new_imports;
+    for (old_id, new_id) in id_remap {
+        replace_all_uses_with(module, old_id, new_id);
+    }
+}
+
+#[cfg(test)]
+mod remove_duplicate_types_tests {
+    use super::*;
+    use rspirv::dr::{Instruction, Module, Operand};
+    use rspirv::spirv::Op;
+
+    fn op_type_int(result_id: u32, width: u32, signed: u32) -> Instruction {
+        Instruction::new(
+            Op::TypeInt,
+            None,
+            Some(result_id),
+            vec![Operand::LiteralBit32(width), Operand::LiteralBit32(signed)],
+        )
+    }
+
+    /// Three `OpTypeInt 32 0` declarations with different result-ids
+    /// should all collapse to one. The previous implementation only
+    /// caught two of them: it advanced `continue_from_idx` past the
+    /// kept instance after each duplicate, so by the third pass the
+    /// dedup HashMap was empty and the third copy was inserted as a
+    /// fresh entry rather than recognised as a duplicate of the first.
+    /// Vulkan rejects the resulting binary with
+    /// "Duplicate non-aggregate type declarations are not allowed".
+    #[test]
+    fn collapses_more_than_two_duplicate_types() {
+        let mut module = Module::new();
+        // Three `OpTypeInt 32 0` with different ids.
+        module.types_global_values.push(op_type_int(10, 32, 0));
+        module.types_global_values.push(op_type_int(20, 32, 0));
+        module.types_global_values.push(op_type_int(30, 32, 0));
+
+        let linked = remove_duplicate_types(module);
+
+        let int_count = linked
+            .types_global_values
+            .iter()
+            .filter(|i| i.class.opcode == Op::TypeInt)
+            .count();
+        assert_eq!(
+            int_count, 1,
+            "expected the three duplicate OpTypeInt to collapse to one, got {int_count}",
+        );
+    }
+
+    /// `OpConstant %float 0` and `OpConstant %uint 0` have identical
+    /// operands but different result-types, so they must NOT be
+    /// collapsed. The previous dedup key was `(opcode, operands)` only,
+    /// which silently merged them — and downstream uses (like an
+    /// `OpConstantComposite %v3float ...`) ended up referencing a
+    /// `uint` constant where a `float` was expected, producing
+    /// "OpConstantComposite Constituent <id>'s type does not match
+    /// Result Type's vector element type" at SPIR-V validation.
+    #[test]
+    fn keeps_constants_with_same_value_but_different_types() {
+        let float_type_id = 1_u32;
+        let uint_type_id = 2_u32;
+        let float_zero_id = 10_u32;
+        let uint_zero_id = 20_u32;
+
+        let mut module = Module::new();
+        module.types_global_values.push(Instruction::new(
+            Op::TypeFloat,
+            None,
+            Some(float_type_id),
+            vec![Operand::LiteralBit32(32)],
+        ));
+        module.types_global_values.push(Instruction::new(
+            Op::TypeInt,
+            None,
+            Some(uint_type_id),
+            vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+        ));
+        module.types_global_values.push(Instruction::new(
+            Op::Constant,
+            Some(float_type_id),
+            Some(float_zero_id),
+            vec![Operand::LiteralBit32(0)],
+        ));
+        module.types_global_values.push(Instruction::new(
+            Op::Constant,
+            Some(uint_type_id),
+            Some(uint_zero_id),
+            vec![Operand::LiteralBit32(0)],
+        ));
+
+        let linked = remove_duplicate_types(module);
+
+        let constants: Vec<&Instruction> = linked
+            .types_global_values
+            .iter()
+            .filter(|i| i.class.opcode == Op::Constant)
+            .collect();
+        assert_eq!(
+            constants.len(),
+            2,
+            "constants with same operands but different result-types must not merge"
+        );
+        // Both type-id-distinct constants survive.
+        assert!(
+            constants
+                .iter()
+                .any(|c| c.result_type == Some(float_type_id)),
+            "float zero constant got dropped"
+        );
+        assert!(
+            constants
+                .iter()
+                .any(|c| c.result_type == Some(uint_type_id)),
+            "uint zero constant got dropped"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dedup_entry_point_interfaces_tests {
+    use super::*;
+    use rspirv::dr::{Instruction, Module, Operand};
+    use rspirv::spirv::{ExecutionModel, Op};
+
+    /// `OpEntryPoint Compute %main "main" %5 %7 %5` (with a duplicate
+    /// in the interface list, mimicking the post-dedup state where
+    /// two original variables collapsed to the same id) should
+    /// collapse to `... %5 %7`. Vulkan rejects the binary otherwise
+    /// with "Non-unique OpEntryPoint interface".
+    #[test]
+    fn drops_duplicate_interface_ids() {
+        let mut module = Module::new();
+        module.entry_points.push(Instruction::new(
+            Op::EntryPoint,
+            None,
+            None,
+            vec![
+                Operand::ExecutionModel(ExecutionModel::GLCompute),
+                Operand::IdRef(1),
+                Operand::LiteralString("main".to_owned()),
+                Operand::IdRef(5),
+                Operand::IdRef(7),
+                Operand::IdRef(5),
+            ],
+        ));
+
+        dedup_entry_point_interfaces(&mut module);
+
+        let interface: Vec<u32> = module.entry_points[0]
+            .operands
+            .iter()
+            .skip(3)
+            .filter_map(|op| {
+                if let Operand::IdRef(id) = op {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(interface, vec![5, 7]);
+    }
+}
+
+#[cfg(test)]
+mod remove_duplicate_annotations_tests {
+    use super::*;
+    use rspirv::dr::{Instruction, Module, Operand};
+    use rspirv::spirv::{Decoration, Op};
+
+    /// After ID dedup collapses two `OpVariable`s onto the same id, every
+    /// `OpDecorate` that previously decorated either of them now decorates
+    /// the kept id — producing two identical `OpDecorate %5 DescriptorSet 0`
+    /// (and similar) entries. spirv-val rejects this with "ID 'N' decorated
+    /// with DescriptorSet multiple times is not allowed". Dedup must collapse
+    /// fully-identical annotation instructions.
+    #[test]
+    fn collapses_identical_op_decorate_pairs() {
+        let mut module = Module::new();
+        let target = 5_u32;
+        let make_decorate_descriptor_set = || {
+            Instruction::new(
+                Op::Decorate,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(target),
+                    Operand::Decoration(Decoration::DescriptorSet),
+                    Operand::LiteralBit32(0),
+                ],
+            )
+        };
+        let make_decorate_binding = || {
+            Instruction::new(
+                Op::Decorate,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(target),
+                    Operand::Decoration(Decoration::Binding),
+                    Operand::LiteralBit32(7),
+                ],
+            )
+        };
+        // Two duplicate DescriptorSet decorations and two duplicate Binding
+        // decorations — exactly what ID dedup leaves behind.
+        module.annotations.push(make_decorate_descriptor_set());
+        module.annotations.push(make_decorate_binding());
+        module.annotations.push(make_decorate_descriptor_set());
+        module.annotations.push(make_decorate_binding());
+
+        // A non-duplicate decoration on a different id should be preserved.
+        module.annotations.push(Instruction::new(
+            Op::Decorate,
+            None,
+            None,
+            vec![
+                Operand::IdRef(9),
+                Operand::Decoration(Decoration::DescriptorSet),
+                Operand::LiteralBit32(0),
+            ],
+        ));
+
+        remove_duplicate_annotations(&mut module);
+
+        assert_eq!(
+            module.annotations.len(),
+            3,
+            "expected 4 duplicates to collapse to 2, plus the unrelated one to remain"
+        );
+        let descriptor_set_count = module
+            .annotations
+            .iter()
+            .filter(|i| {
+                i.class.opcode == Op::Decorate
+                    && i.operands.first() == Some(&Operand::IdRef(target))
+                    && i.operands.get(1) == Some(&Operand::Decoration(Decoration::DescriptorSet))
+            })
+            .count();
+        assert_eq!(descriptor_set_count, 1);
+        let binding_count = module
+            .annotations
+            .iter()
+            .filter(|i| {
+                i.class.opcode == Op::Decorate
+                    && i.operands.first() == Some(&Operand::IdRef(target))
+                    && i.operands.get(1) == Some(&Operand::Decoration(Decoration::Binding))
+            })
+            .count();
+        assert_eq!(binding_count, 1);
+    }
+}
+
+#[cfg(test)]
+mod ext_inst_imports_dedup_tests {
+    use super::*;
+    use rspirv::dr::{Instruction, Module, Operand};
+    use rspirv::spirv::Op;
+
+    /// Construct a tiny module with two `OpExtInstImport "GLSL.std.450"`
+    /// declarations (mimicking the post-id-shift state of two merged
+    /// inputs) plus a single `OpExtInst` that references the second
+    /// (later) import. The dedup pass must keep the first import and
+    /// rewrite the `OpExtInst` set-id to point at it.
+    #[test]
+    fn rewrites_op_ext_inst_set_id_when_dropping_duplicate() {
+        let kept_id = 5_u32;
+        let dropped_id = 47_u32;
+
+        let import_glsl_first = Instruction::new(
+            Op::ExtInstImport,
+            None,
+            Some(kept_id),
+            vec![Operand::LiteralString("GLSL.std.450".to_owned())],
+        );
+        let import_glsl_second = Instruction::new(
+            Op::ExtInstImport,
+            None,
+            Some(dropped_id),
+            vec![Operand::LiteralString("GLSL.std.450".to_owned())],
+        );
+
+        // OpExtInst is permitted inside a function body. Build a minimal
+        // function with one block holding the call we want to verify.
+        let result_type = 100_u32;
+        let result_id = 101_u32;
+        let arg_id = 102_u32;
+        // GLSL.std.450 Sqrt = 31
+        let glsl_sqrt = 31_u32;
+
+        let ext_inst_call = Instruction::new(
+            Op::ExtInst,
+            Some(result_type),
+            Some(result_id),
+            vec![
+                Operand::IdRef(dropped_id),
+                Operand::LiteralBit32(glsl_sqrt),
+                Operand::IdRef(arg_id),
+            ],
+        );
+
+        let block = rspirv::dr::Block {
+            label: Some(Instruction::new(Op::Label, None, Some(200), vec![])),
+            instructions: vec![ext_inst_call],
+        };
+        let func_def = Instruction::new(
+            Op::Function,
+            Some(result_type),
+            Some(300),
+            vec![
+                Operand::FunctionControl(rspirv::spirv::FunctionControl::NONE),
+                Operand::IdRef(result_type),
+            ],
+        );
+        let func_end = Instruction::new(Op::FunctionEnd, None, None, vec![]);
+
+        let func = rspirv::dr::Function {
+            def: Some(func_def),
+            end: Some(func_end),
+            parameters: vec![],
+            blocks: vec![block],
+        };
+
+        let mut module = Module::new();
+        module.ext_inst_imports.push(import_glsl_first);
+        module.ext_inst_imports.push(import_glsl_second);
+        module.functions.push(func);
+
+        remove_duplicate_ext_inst_imports(&mut module);
+
+        // Only the first import survives.
+        assert_eq!(module.ext_inst_imports.len(), 1);
+        assert_eq!(module.ext_inst_imports[0].result_id, Some(kept_id));
+
+        // The OpExtInst's set-id must have been rewritten to point at
+        // the surviving import — that's what the bug fix is for.
+        let call = &module.functions[0].blocks[0].instructions[0];
+        assert_eq!(call.class.opcode, Op::ExtInst);
+        match &call.operands[0] {
+            Operand::IdRef(id) => assert_eq!(
+                *id, kept_id,
+                "OpExtInst set-id should have been rewritten from \
+                 dropped {dropped_id} to kept {kept_id}, got {id}"
+            ),
+            other => panic!("expected IdRef, got {other:?}"),
+        }
+    }
 }
 
 fn kill_with_id(insts: &mut Vec<rspirv::dr::Instruction>, id: u32) {
@@ -189,19 +579,19 @@ fn remove_duplicate_types(module: rspirv::dr::Module) -> rspirv::dr::Module {
     let mut def_use_analyzer = DefUseAnalyzer::new(&mut instructions);
 
     let mut kill_annotations = vec![];
-    let mut continue_from_idx = 0;
 
-    // need to do this process iteratively because types can reference each other
+    // Iterative because types can reference each other: after merging
+    // `OpTypeInt %A`/`%B`, two `OpTypePointer`s that were pointing at
+    // each become identical and themselves become duplicates. We
+    // restart from index 0 with a fresh dedup map every pass — an
+    // earlier optimisation tried to resume from the latest backtrack
+    // point but ended up advancing past kept instances and silently
+    // missing duplicate groups in the tail of the array.
     loop {
         let mut dedup = std::collections::HashMap::new();
         let mut duplicate = None;
 
-        for (iterator_idx, module_inst) in module
-            .types_global_values
-            .iter()
-            .enumerate()
-            .skip(continue_from_idx)
-        {
+        for module_inst in module.types_global_values.iter() {
             // Some `types_global_values` entries don't carry a
             // `result_id` — most relevantly `OpTypeForwardPointer`,
             // which DXC can emit when targeting `universal1.5`. We
@@ -215,12 +605,28 @@ fn remove_duplicate_types(module: rspirv::dr::Module) -> rspirv::dr::Module {
                 continue;
             }
 
-            // partially assemble only the opcode and operands to be used as a key
-            // maybe this should also include the result_type
+            // Partial assembly used as a dedup key: opcode, result-type
+            // (if any), and operands. The result-type is essential —
+            // `OpConstant %float 0` and `OpConstant %uint 0` have
+            // identical operands but are different constants, and
+            // collapsing them produced an `OpConstantComposite %v3float
+            // %uint_0 %uint_0 %uint_0` type-mismatch downstream.
             let data = {
                 let mut data = vec![];
 
                 data.push(inst.class.opcode as u32);
+                // Sentinel-prefixed result-type so a None / Some(0) on
+                // typed instructions can't be confused for a missing
+                // type on type-defining ones (which never have one).
+                match inst.result_type {
+                    Some(t) => {
+                        data.push(0xffff_ffff);
+                        data.push(t);
+                    }
+                    None => {
+                        data.push(0xffff_fffe);
+                    }
+                }
                 for op in &inst.operands {
                     op.assemble_into(&mut data);
                 }
@@ -228,24 +634,19 @@ fn remove_duplicate_types(module: rspirv::dr::Module) -> rspirv::dr::Module {
                 data
             };
 
-            // dedup contains a tuple of three indices;
-            // the first two point into our `def_use_analyzer.instructions` map
-            // the last one points into the `module.types_global_values` iterator so we can resume iteration
             dedup
                 .entry(data)
-                .and_modify(|(identical_idx, backtrack_idx)| {
-                    duplicate = Some((inst_idx, *identical_idx, *backtrack_idx));
+                .and_modify(|identical_idx| {
+                    duplicate = Some((inst_idx, *identical_idx));
                 })
-                .or_insert((inst_idx, iterator_idx)); // store the index that we encountered an instruction
-                                                      // for the first time so we can backtrack later
+                .or_insert(inst_idx);
 
-            if let Some((_, _, backtrack_idx)) = duplicate {
-                continue_from_idx = backtrack_idx;
+            if duplicate.is_some() {
                 break;
             }
         }
 
-        if let Some((before_idx, after_idx, _)) = duplicate {
+        if let Some((before_idx, after_idx)) = duplicate {
             let before_id = def_use_analyzer.instructions[before_idx].result_id.unwrap();
             let after_id = def_use_analyzer.instructions[after_idx].result_id.unwrap();
 
@@ -612,10 +1013,18 @@ fn kill_linkage_instructions(
     }
 
     // drop imported variables
+    //
+    // `types_global_values` mixes type declarations, constants, and
+    // global `OpVariable`s — most carry a `result_id`, but a few don't
+    // (notably `OpTypeForwardPointer`, which DXC can emit when targeting
+    // `universal1.5`). Treat those as never-matching: they can't be the
+    // import we're looking at, and unconditionally `.unwrap()`-ing
+    // panics the linker on otherwise-valid inputs.
     for pair in pairs.iter() {
-        module
-            .types_global_values
-            .retain(|v| pair.import.id != v.result_id.unwrap());
+        module.types_global_values.retain(|v| match v.result_id {
+            Some(id) => pair.import.id != id,
+            None => true,
+        });
     }
 
     // drop linkage attributes (both import and export)
@@ -689,6 +1098,447 @@ fn compact_ids(module: &mut rspirv::dr::Module) -> u32 {
     });
 
     remap.len() as u32 + 1
+}
+
+/// Remove fully-identical duplicate instructions from
+/// `module.annotations`. After merging input modules, dedup of types /
+/// variables collapses ids — and the `OpDecorate` / `OpMemberDecorate`
+/// instructions that previously decorated the dropped ids get rewritten
+/// to point at the kept ones, leaving the kept ids decorated multiple
+/// times with the same decoration. spirv-val rejects e.g. "ID 'N'
+/// decorated with DescriptorSet multiple times is not allowed".
+fn remove_duplicate_annotations(module: &mut rspirv::dr::Module) {
+    use rspirv::binary::Assemble;
+    let mut seen = HashSet::new();
+    let original = std::mem::take(&mut module.annotations);
+    module.annotations.reserve(original.len());
+    for inst in original {
+        let mut key = vec![inst.class.opcode as u32];
+        for op in &inst.operands {
+            op.assemble_into(&mut key);
+        }
+        if seen.insert(key) {
+            module.annotations.push(inst);
+        }
+    }
+}
+
+/// `OpEntryPoint`'s interface list (the IdRef operands after the
+/// execution model, function id, and name) names every `Input` /
+/// `Output` / `StorageBuffer` / `Workgroup` / `Private` global
+/// variable the entry point uses. After we merge multiple input
+/// modules, dedup of `OpVariable`s collapses two names that pointed at
+/// what's now the same id — but the entry point's interface list
+/// still mentions both of them, so the merged id appears more than
+/// once. spirv-val rejects the binary with "Non-unique OpEntryPoint
+/// interface 'N[%N]' is disallowed".
+///
+/// Walk every `OpEntryPoint`, drop duplicate IdRefs in the trailing
+/// interface section while preserving order.
+fn dedup_entry_point_interfaces(module: &mut rspirv::dr::Module) {
+    for inst in module.entry_points.iter_mut() {
+        if inst.class.opcode != spirv::Op::EntryPoint {
+            continue;
+        }
+        // Operands 0..=2 are the ExecutionModel, function id, and
+        // name; everything from index 3 on is the interface list.
+        const INTERFACE_START: usize = 3;
+        if inst.operands.len() <= INTERFACE_START {
+            continue;
+        }
+
+        let head: Vec<_> = inst.operands.drain(..INTERFACE_START).collect();
+        let mut seen = HashSet::new();
+        let mut deduped: Vec<rspirv::dr::Operand> = Vec::new();
+        for op in inst.operands.drain(..) {
+            match op {
+                rspirv::dr::Operand::IdRef(id) => {
+                    if seen.insert(id) {
+                        deduped.push(rspirv::dr::Operand::IdRef(id));
+                    }
+                }
+                other => deduped.push(other),
+            }
+        }
+        inst.operands = head;
+        inst.operands.extend(deduped);
+    }
+}
+
+/// Drop `OpCapability` (and the matching `OpExtension`) declarations that
+/// nothing in the linked module actually uses.
+///
+/// DXC under `-fspv-target-env=universal1.5` declares a kitchen-sink set
+/// of capabilities and extensions on every emitted lib (the universal
+/// envelope advertises every optional feature DXC can target). After
+/// linking a compute shader, the result still carries declarations like
+/// `OpCapability MinLod`, `OpCapability FragmentShaderSampleInterlockEXT`,
+/// `OpCapability ComputeDerivativeGroupQuadsKHR`, etc., even though no
+/// instruction references them. Vulkan's validation layer rejects each
+/// one with VUID-VkShaderModuleCreateInfo-pCode-08740 / -08742 unless
+/// the corresponding `VkPhysicalDeviceFeatures` bit is enabled.
+///
+/// The conceptually right fix is the SPIR-V grammar's full
+/// "capability-required-by-opcode" table (which is what
+/// `spirv-opt --trim-capabilities` uses). We don't have that data
+/// bundled, so this pass handles the specific capabilities DXC over-
+/// declares for compute shaders, with a hand-curated predicate per
+/// capability that asks "does any instruction in the module actually
+/// require this?". Capabilities outside this denylist are left alone.
+fn trim_unused_capabilities(module: &mut rspirv::dr::Module) {
+    // Each entry: (capability we'll drop if `is_used` returns false,
+    // optional extension to drop alongside *iff* every capability that
+    // depends on that extension is also being dropped).
+    //
+    // The extension is dropped via a separate pass after we know the
+    // final kept-capability set, so capabilities that share an extension
+    // (e.g. ComputeDerivativeGroup{Quads,Linear}KHR both ride on
+    // SPV_KHR_compute_shader_derivatives) are handled correctly: the
+    // extension only goes away when none of its consumers remain.
+    struct Rule {
+        capability: spirv::Capability,
+        extension: Option<&'static str>,
+        is_used: fn(&rspirv::dr::Module) -> bool,
+    }
+
+    let rules: &[Rule] = &[
+        Rule {
+            capability: spirv::Capability::MinLod,
+            extension: None,
+            is_used: uses_image_min_lod,
+        },
+        Rule {
+            capability: spirv::Capability::InterpolationFunction,
+            extension: None,
+            is_used: uses_glsl_interpolate_at,
+        },
+        Rule {
+            capability: spirv::Capability::FragmentShaderSampleInterlockEXT,
+            extension: Some("SPV_EXT_fragment_shader_interlock"),
+            is_used: uses_fragment_sample_interlock,
+        },
+        Rule {
+            capability: spirv::Capability::FragmentShaderPixelInterlockEXT,
+            extension: Some("SPV_EXT_fragment_shader_interlock"),
+            is_used: uses_fragment_pixel_interlock,
+        },
+        Rule {
+            capability: spirv::Capability::FragmentShaderShadingRateInterlockEXT,
+            extension: Some("SPV_EXT_fragment_shader_interlock"),
+            is_used: uses_fragment_shading_rate_interlock,
+        },
+        Rule {
+            capability: spirv::Capability::ComputeDerivativeGroupQuadsKHR,
+            extension: Some("SPV_KHR_compute_shader_derivatives"),
+            is_used: uses_compute_derivative_group_quads,
+        },
+        Rule {
+            capability: spirv::Capability::ComputeDerivativeGroupLinearKHR,
+            extension: Some("SPV_KHR_compute_shader_derivatives"),
+            is_used: uses_compute_derivative_group_linear,
+        },
+        Rule {
+            capability: spirv::Capability::QuadControlKHR,
+            extension: Some("SPV_KHR_quad_control"),
+            is_used: uses_quad_control,
+        },
+        Rule {
+            capability: spirv::Capability::GroupNonUniformPartitionedEXT,
+            extension: Some("SPV_NV_shader_subgroup_partitioned"),
+            is_used: uses_group_non_uniform_partitioned,
+        },
+    ];
+
+    let mut drop_caps: HashSet<spirv::Capability> = HashSet::new();
+    // For each extension under consideration, count how many of its rules
+    // still keep the capability — the extension only goes if all such
+    // rules choose to drop.
+    let mut extension_keepers: HashMap<&'static str, usize> = HashMap::new();
+    for rule in rules {
+        if let Some(ext) = rule.extension {
+            *extension_keepers.entry(ext).or_insert(0) += 0;
+        }
+    }
+    for rule in rules {
+        let used = (rule.is_used)(module);
+        if !used {
+            drop_caps.insert(rule.capability);
+        } else if let Some(ext) = rule.extension {
+            *extension_keepers.get_mut(ext).unwrap() += 1;
+        }
+    }
+    let drop_exts: HashSet<&'static str> = extension_keepers
+        .into_iter()
+        .filter_map(|(ext, keepers)| if keepers == 0 { Some(ext) } else { None })
+        .collect();
+
+    module
+        .capabilities
+        .retain(|inst| match inst.operands.first() {
+            Some(rspirv::dr::Operand::Capability(c)) => !drop_caps.contains(c),
+            _ => true,
+        });
+    module
+        .extensions
+        .retain(|inst| match inst.operands.first() {
+            Some(rspirv::dr::Operand::LiteralString(s)) => !drop_exts.contains(s.as_str()),
+            _ => true,
+        });
+}
+
+fn uses_image_min_lod(module: &rspirv::dr::Module) -> bool {
+    for inst in module.all_inst_iter() {
+        for op in &inst.operands {
+            if let rspirv::dr::Operand::ImageOperands(io) = op {
+                if io.contains(spirv::ImageOperands::MIN_LOD) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn uses_glsl_interpolate_at(module: &rspirv::dr::Module) -> bool {
+    // GLSL.std.450 InterpolateAtCentroid = 76, AtSample = 77, AtOffset = 78.
+    let glsl_id = module.ext_inst_imports.iter().find_map(|inst| {
+        let name = match inst.operands.first()? {
+            rspirv::dr::Operand::LiteralString(s) => s,
+            _ => return None,
+        };
+        if name == "GLSL.std.450" {
+            inst.result_id
+        } else {
+            None
+        }
+    });
+    let Some(glsl_id) = glsl_id else {
+        return false;
+    };
+    for inst in module.all_inst_iter() {
+        if inst.class.opcode != spirv::Op::ExtInst {
+            continue;
+        }
+        let Some(rspirv::dr::Operand::IdRef(set)) = inst.operands.first() else {
+            continue;
+        };
+        if *set != glsl_id {
+            continue;
+        }
+        let n = match inst.operands.get(1) {
+            Some(rspirv::dr::Operand::LiteralExtInstInteger(n)) => *n,
+            Some(rspirv::dr::Operand::LiteralBit32(n)) => *n,
+            _ => continue,
+        };
+        if matches!(n, 76 | 77 | 78) {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_execution_mode(module: &rspirv::dr::Module, want: spirv::ExecutionMode) -> bool {
+    module.execution_modes.iter().any(|inst| {
+        inst.operands
+            .iter()
+            .any(|op| matches!(op, rspirv::dr::Operand::ExecutionMode(m) if *m == want))
+    })
+}
+
+fn has_opcode(module: &rspirv::dr::Module, want: spirv::Op) -> bool {
+    module.all_inst_iter().any(|inst| inst.class.opcode == want)
+}
+
+fn uses_fragment_sample_interlock(module: &rspirv::dr::Module) -> bool {
+    has_execution_mode(module, spirv::ExecutionMode::SampleInterlockOrderedEXT)
+        || has_execution_mode(module, spirv::ExecutionMode::SampleInterlockUnorderedEXT)
+}
+
+fn uses_fragment_pixel_interlock(module: &rspirv::dr::Module) -> bool {
+    has_execution_mode(module, spirv::ExecutionMode::PixelInterlockOrderedEXT)
+        || has_execution_mode(module, spirv::ExecutionMode::PixelInterlockUnorderedEXT)
+}
+
+fn uses_fragment_shading_rate_interlock(module: &rspirv::dr::Module) -> bool {
+    has_execution_mode(module, spirv::ExecutionMode::ShadingRateInterlockOrderedEXT)
+        || has_execution_mode(
+            module,
+            spirv::ExecutionMode::ShadingRateInterlockUnorderedEXT,
+        )
+}
+
+fn uses_compute_derivative_group_quads(module: &rspirv::dr::Module) -> bool {
+    has_execution_mode(module, spirv::ExecutionMode::DerivativeGroupQuadsKHR)
+}
+
+fn uses_compute_derivative_group_linear(module: &rspirv::dr::Module) -> bool {
+    has_execution_mode(module, spirv::ExecutionMode::DerivativeGroupLinearKHR)
+}
+
+fn uses_quad_control(module: &rspirv::dr::Module) -> bool {
+    // SPIR-V QuadControlKHR is required by OpGroupNonUniformQuadAllKHR
+    // and OpGroupNonUniformQuadAnyKHR. rspirv exposes the All variant;
+    // the Any variant has the next opcode number (5111) but isn't named
+    // in this rspirv build, so check by raw opcode integer.
+    module.all_inst_iter().any(|inst| {
+        inst.class.opcode == spirv::Op::GroupNonUniformQuadAllKHR
+            || inst.class.opcode as u32 == 5111
+    })
+}
+
+fn uses_group_non_uniform_partitioned(module: &rspirv::dr::Module) -> bool {
+    has_opcode(module, spirv::Op::GroupNonUniformPartitionEXT)
+}
+
+#[cfg(test)]
+mod trim_unused_capabilities_tests {
+    use super::*;
+    use rspirv::dr::{Instruction, Module, Operand};
+    use rspirv::spirv::{Capability, Op};
+
+    fn op_capability(cap: Capability) -> Instruction {
+        Instruction::new(Op::Capability, None, None, vec![Operand::Capability(cap)])
+    }
+    fn op_extension(name: &str) -> Instruction {
+        Instruction::new(
+            Op::Extension,
+            None,
+            None,
+            vec![Operand::LiteralString(name.to_owned())],
+        )
+    }
+
+    /// A compute module with no instruction that references any of the
+    /// over-declared capabilities should have all of them stripped, plus
+    /// the matching extensions.
+    #[test]
+    fn drops_unused_capabilities_and_extensions_on_compute_module() {
+        let mut module = Module::new();
+        // Keep one capability we don't trim (Shader) so we can assert
+        // unrelated entries aren't disturbed.
+        module.capabilities.push(op_capability(Capability::Shader));
+        module.capabilities.push(op_capability(Capability::MinLod));
+        module
+            .capabilities
+            .push(op_capability(Capability::InterpolationFunction));
+        module
+            .capabilities
+            .push(op_capability(Capability::FragmentShaderSampleInterlockEXT));
+        module
+            .capabilities
+            .push(op_capability(Capability::FragmentShaderPixelInterlockEXT));
+        module.capabilities.push(op_capability(
+            Capability::FragmentShaderShadingRateInterlockEXT,
+        ));
+        module
+            .capabilities
+            .push(op_capability(Capability::ComputeDerivativeGroupQuadsKHR));
+        module
+            .capabilities
+            .push(op_capability(Capability::ComputeDerivativeGroupLinearKHR));
+        module
+            .capabilities
+            .push(op_capability(Capability::QuadControlKHR));
+        module
+            .capabilities
+            .push(op_capability(Capability::GroupNonUniformPartitionedEXT));
+        module
+            .extensions
+            .push(op_extension("SPV_EXT_fragment_shader_interlock"));
+        module
+            .extensions
+            .push(op_extension("SPV_KHR_compute_shader_derivatives"));
+        module.extensions.push(op_extension("SPV_KHR_quad_control"));
+        module
+            .extensions
+            .push(op_extension("SPV_NV_shader_subgroup_partitioned"));
+        // Unrelated extension that no rule touches.
+        module
+            .extensions
+            .push(op_extension("SPV_KHR_storage_buffer_storage_class"));
+
+        trim_unused_capabilities(&mut module);
+
+        let kept_caps: Vec<Capability> = module
+            .capabilities
+            .iter()
+            .filter_map(|inst| match inst.operands.first() {
+                Some(Operand::Capability(c)) => Some(*c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kept_caps,
+            vec![Capability::Shader],
+            "all denylisted capabilities should be dropped"
+        );
+
+        let kept_exts: Vec<String> = module
+            .extensions
+            .iter()
+            .filter_map(|inst| match inst.operands.first() {
+                Some(Operand::LiteralString(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kept_exts,
+            vec!["SPV_KHR_storage_buffer_storage_class".to_owned()],
+            "extensions tied to dropped capabilities should be dropped, others left alone"
+        );
+    }
+
+    /// If an instruction in the module actually uses the capability
+    /// (here: an `ImageOperands::MIN_LOD` bit on a sampling op), the
+    /// trim pass must keep the corresponding `OpCapability MinLod`.
+    #[test]
+    fn keeps_min_lod_when_image_operand_uses_it() {
+        let mut module = Module::new();
+        module.capabilities.push(op_capability(Capability::MinLod));
+
+        // Synthesize a function with one OpImageSampleExplicitLod whose
+        // ImageOperands carries the MIN_LOD bit. The exact ids aren't
+        // important — the trim pass only walks operands looking for the
+        // bitflag.
+        let sample = Instruction::new(
+            Op::ImageSampleExplicitLod,
+            Some(10),
+            Some(11),
+            vec![
+                Operand::IdRef(20),
+                Operand::IdRef(21),
+                Operand::ImageOperands(spirv::ImageOperands::MIN_LOD),
+                Operand::IdRef(22),
+            ],
+        );
+        let block = rspirv::dr::Block {
+            label: Some(Instruction::new(Op::Label, None, Some(99), vec![])),
+            instructions: vec![sample],
+        };
+        let func = rspirv::dr::Function {
+            def: Some(Instruction::new(
+                Op::Function,
+                Some(10),
+                Some(100),
+                vec![
+                    Operand::FunctionControl(spirv::FunctionControl::NONE),
+                    Operand::IdRef(10),
+                ],
+            )),
+            end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
+            parameters: vec![],
+            blocks: vec![block],
+        };
+        module.functions.push(func);
+
+        trim_unused_capabilities(&mut module);
+
+        assert_eq!(
+            module.capabilities.len(),
+            1,
+            "MinLod capability must be retained while an image operand uses MIN_LOD"
+        );
+    }
 }
 
 fn sort_globals(module: &mut rspirv::dr::Module) {
@@ -986,6 +1836,7 @@ pub fn link(inputs: &mut [&mut rspirv::dr::Module], opts: &Options) -> Result<rs
 
     // remove duplicates (https://github.com/KhronosGroup/SPIRV-Tools/blob/e7866de4b1dc2a7e8672867caeb0bdca49f458d3/source/opt/remove_duplicates_pass.cpp)
     remove_duplicate_capablities(&mut output);
+    remove_duplicate_extensions(&mut output);
     remove_duplicate_ext_inst_imports(&mut output);
     let mut output = remove_duplicate_types(output);
     // jb-todo: strip identical OpDecoration / OpDecorationGroups
@@ -1000,6 +1851,10 @@ pub fn link(inputs: &mut [&mut rspirv::dr::Module], opts: &Options) -> Result<rs
 
     // remove linkage specific instructions
     kill_linkage_instructions(&matching_pairs, &mut output, &opts);
+
+    dedup_entry_point_interfaces(&mut output);
+    remove_duplicate_annotations(&mut output);
+    trim_unused_capabilities(&mut output);
 
     sort_globals(&mut output);
 
